@@ -1,12 +1,31 @@
-import java.awt.{Color, Graphics, Graphics2D, BorderLayout}
+import java.awt.{BorderLayout, Color, Graphics, Graphics2D, Image}
+import java.util.concurrent.{ExecutorService, Executors}
 import javax.swing.{JComponent, JFrame, WindowConstants}
 import scala.annotation.tailrec
 import scala.io.Source
 import scala.collection.immutable.StringOps
+import scala.concurrent.{Await, ExecutionContext, Future}
+import scala.concurrent.duration.Duration
 import scala.math.pow
+import javax.swing.ImageIcon
+import java.awt.BasicStroke
 
 object Solver {
-  type Vec2 = (Double, Double)
+  case class Vec2 (
+    x: Double,
+    y: Double
+  )
+
+  case class Path (
+    part1: Array[Int],
+    part2: Array[Int],
+    cost: Double
+  )
+
+  case class Result (
+    indexData: (Int, Int),
+    path: Path
+  )
 
   implicit class PowerInt(val i:Double) extends AnyVal {
     def ** (exp:Double):Double = pow(i,exp)
@@ -22,153 +41,194 @@ object Solver {
     mid ^ 0x75bd924;
   }
 
-  def calcRand(count: Int): List[(Int, Int)] = {
-    var items: List[(Int, Int)] = List((0, 0));
+  def pick(seedIndex: Int, seedsArray: Array[Int]): Array[Int] = {
+    val items = new Array[Int](6)
+    var rand: Int = 0
 
-    for (x <- 1 to count) {
-      items = items :+ (count, nextRand(items(x - 1)._2))
+    for (x <- 0 until 6) {
+      rand = seedsArray(seedIndex + x + 1)
+
+      var idx = rand % 121
+      while (items.contains(idx)) {
+        idx = (idx + 1) % 121
+      }
+
+      items(x) = idx
     }
 
     items
   }
 
-  def pick(points: List[Vec2], seed: Int): (Int, List[Vec2]) = {
-    var items: List[(Double, Double)] = List()
-    var rand: Int = seed
+  def distance(p1: Vec2, p2: Vec2): Double = (p1.x - p2.x) ** 2 + (p1.y - p2.y) ** 2
 
-    for (x <- 0 to 6) {
-      rand = nextRand(rand)
-
-      var idx = rand % 121
-      while (items.contains(points(idx))) {
-        idx = (idx + 1) % 121
-      }
-
-      items = items :+ points(idx)
-    }
-
-    (rand, items)
-  }
-
-  def calculateCost(points: List[Vec2]): Double =
+  def calculateCost(points: Array[Int], costs: Array[Double]): Double =
     points
       .sliding(2)
-      .map(p => (p.head._1 - p.last._1) ** 2 + (p.head._2 - p.last._2) ** 2)
+      .map(p => costs(p.head * 122 + p.last))
       .sum
 
-  def getPathsCosts(points: List[Vec2], start: Vec2): Seq[(Seq[Vec2], Double)] =
+  def getPathsCosts(points: Array[Int], start: Int,  costs: Array[Double]): Seq[(Array[Int], Double)] =
     points
       .permutations
       .map(start +: _)
-      .map(p => (p, calculateCost(p)))
+      .map(p => (p, calculateCost(p, costs)))
       .toSeq
 
-  def getPathsByEnding(points: List[Vec2], start: Vec2): Map[Vec2, (Seq[Vec2], Double)] =
-    getPathsCosts(points, start)
+  def getPathsByEnding(points: Array[Int], start: Int,  costs: Array[Double]): Map[Int, (Array[Int], Double)] =
+    getPathsCosts(points, start, costs)
       .toList
       .groupBy(_._1.last)
       .view.mapValues(p => p.minBy(_._2))
       .toMap
 
-  def optimalPairBySeed(points: List[Vec2], seed: Int): (Seq[Vec2], Seq[Vec2], Double) = {
-    val paths = getAll(points, seed)
+  def optimalPairBySeed(seedIndex: Int, costs: Array[Double], seedsArray: Array[Int]): Path = {
+    val paths = getAll(seedIndex, seedsArray)
 
-    val firstPath = getPathsByEnding(paths._1, (5.15, -5))
+    val firstPath = getPathsByEnding(paths._1, 121, costs)
 
     paths._1
-      .map(p => (p, getPathsCosts(paths._2, p).minBy(_._2)))
+      .map(p => (p, getPathsCosts(paths._2, p, costs).minBy(_._2)))
       .map(p => (firstPath(p._1), p._2))
-      .map(p => (p._1._1, p._2._1, p._1._2 + p._2._2))
-      .minBy(_._3)
+      .map(p => Path(p._1._1, p._2._1, p._1._2 + p._2._2))
+      .minBy(_.cost)
   }
 
-  def getAll(points: List[Vec2], seed: Int): (List[Vec2], List[Vec2]) = {
-    val firstSet = pick(points, seed);
-    val secondSet = pick(points, firstSet._1);
+  def getAll(seedIndex: Int, seedsArray: Array[Int]): (Array[Int], Array[Int]) = {
+    val firstSet = pick(seedIndex, seedsArray);
+    val secondSet = pick(seedIndex + 6, seedsArray);
 
-    (firstSet._2, secondSet._2)
+    (firstSet, secondSet)
+  }
+
+  def getMinMax(threadIdx: Int, startIdx: Int, endIdx: Int, costs: Array[Double], seedsArray: Array[Int]): (Result, Result) =
+  {
+    val count = endIdx - startIdx
+
+    var best: Result = Result((0, 0), optimalPairBySeed(0, costs, seedsArray))
+    var worst: Result = Result((0, 0), optimalPairBySeed(0, costs, seedsArray))
+
+    for (x <- startIdx until endIdx) {
+      val path = optimalPairBySeed(x, costs, seedsArray)
+
+      if (path.cost < best.path.cost) {
+        best = Result((x, seedsArray(x)), path)
+      }
+
+      if (path.cost > worst.path.cost) {
+        worst = Result((x, seedsArray(x)), path)
+      }
+
+      if (x % (count / 100) == 0) {
+        println("Worker " + threadIdx + " at " + x + " (" + ((x - startIdx) * 100 / count) + "%)")
+      }
+    }
+
+    (best, worst)
   }
 
   def main(args: Array[String]): Unit = {
-    val GOAL = 300;
+    val max = 1200;
+    val threadCount = 8
+
+    println("Loading points: ")
 
     val points = Source.fromFile("jedibattleinitial.csv")
       .getLines()
       .map(line => line.split(","))
-      .map(line => (line(0).toDouble, line(1).toDouble))
-      .toList
+      .map(line => Vec2(line(0).toDouble, line(1).toDouble))
+      .toList :+ Vec2(5.15, -5.0)
 
-    var seed = 0
+    println("Computing costs")
+    val costsArray = points
+      .flatMap(p => points.map(p2 => distance(p, p2)))
+      .toArray
 
-    var best: ((Int, Int), (Seq[(Vec2)], Seq[(Vec2)], Double)) = ((0, 0), optimalPairBySeed(points, 0))
-    var worst: ((Int, Int), (Seq[(Vec2)], Seq[(Vec2)], Double)) = ((0, 0), optimalPairBySeed(points, 0))
+    println("Computing seeds")
+    val seeds = new Array[Int](max + 20)
+    seeds(0) = 0;
 
-    val max = 1_000_000;
-    for (x <- 1 to max) {
-      seed = nextRand(seed)
-
-      val path = optimalPairBySeed(points, seed)
-
-      if (path._3 < best._2._3) {
-        best = ((x, seed), path)
-      }
-
-      if (path._3 > worst._2._3) {
-        worst = ((x, seed), path)
-      }
-
-      if (x % (max / 1000) == 0) {
-        println(x + " " + (x.asInstanceOf[Double] / max.asInstanceOf[Double]))
-      }
+    for (x <- 1 until max + 20) {
+      seeds(x) = nextRand(seeds(x-1))
     }
 
+    println("Calculating paths")
+
+    implicit val ec: ExecutionContext = new ExecutionContext {
+      val threadPool: ExecutorService = Executors.newFixedThreadPool(threadCount)
+
+      def execute(runnable: Runnable): Unit = {
+        threadPool.submit(runnable)
+      }
+
+      def reportFailure(t: Throwable): Unit = {}
+    }
+
+    val workers = (Range(0, max, max / threadCount) :+ max)
+      .sliding(2)
+      .zipWithIndex
+      .map(p => Future { getMinMax(p._2, p._1.head, p._1.last, costsArray, seeds) })
+
+    val work = Future.sequence(workers)
+    val results = Await.result(work, Duration.Inf).toSeq
+
+    val best = results.minBy(_._1.path.cost)._1
+    val worst = results.maxBy(_._2.path.cost)._2
+
+    println()
     println("Best: ")
-    println(best._1)
+    println(best.indexData)
 
-    println(best._2._1.map(p => points.indexOf(p)))
-    println(best._2._2.map(p => points.indexOf(p)))
-    println(best._2._3)
+    println(best.path.part1.map(p => points(p)).mkString("Array(", ", ", ")"))
+    println(best.path.part2.map(p => points(p)).mkString("Array(", ", ", ")"))
+    println(best.path.cost)
 
+    println()
     println("Worst: ")
-    println(worst._1)
+    println(worst.indexData)
 
-    println(worst._2._1.map(p => points.indexOf(p)))
-    println(worst._2._2.map(p => points.indexOf(p)))
-    println(worst._2._3)
+    println(worst.path.part1.map(p => points(p)).mkString("Array(", ", ", ")"))
+    println(worst.path.part2.map(p => points(p)).mkString("Array(", ", ", ")"))
+    println(worst.path.cost)
 
     def toVisible(point: Vec2): (Int, Int) =
-      (((point._1 + 8) * 64).asInstanceOf[Int], ((point._2 + 8) * 64).asInstanceOf[Int])
+      (((point.x + 11) * 48).asInstanceOf[Int], ((point.y + 11) * 48).asInstanceOf[Int])
 
 
-    def drawPoints(p1: Seq[Vec2], p2: Seq[Vec2], g2: Graphics2D, c1: Color, c2: Color): Unit = {
+    def drawPoints(p1: Seq[Int], p2: Seq[Int], g2: Graphics2D, c1: Color, c2: Color): Unit = {
+
       g2.setColor(c1)
       p1.sliding(2).foreach(ps => {
-        g2.drawLine(toVisible(ps.head)._1, toVisible(ps.head)._2, toVisible(ps.last)._1, toVisible(ps.last)._2)
+        g2.drawLine(1064 - toVisible(points(ps.head))._1, toVisible(points(ps.head))._2, 1064 - toVisible(points(ps.last))._1, toVisible(points(ps.last))._2)
       })
 
       g2.setColor(c2)
       p2.sliding(2).foreach(ps => {
-        g2.drawLine(toVisible(ps.head)._1, toVisible(ps.head)._2, toVisible(ps.last)._1, toVisible(ps.last)._2)
+        g2.drawLine(1064 - toVisible(points(ps.head))._1, toVisible(points(ps.head))._2, 1064 - toVisible(points(ps.last))._1, toVisible(points(ps.last))._2)
       })
     }
 
     def createContentPane =
       new JComponent {
+        val image: Image = new ImageIcon("background.png").getImage
         override def paintComponent(g: Graphics): Unit = {
           super.paintComponent(g)
 
           val g2 = g.create.asInstanceOf[Graphics2D]
-          g2.setColor(Color.WHITE)
-          g2.setBackground(Color.BLACK)
+          g2.setStroke(new BasicStroke(4))
 
+          g2.setColor(Color.BLACK)
+          g2.setBackground(Color.BLACK)
           g2.clearRect(0, 0, 6000, 6000)
+
+          g2.drawImage(image, 0, 0, null)
+
           points.foreach(p => {
-            g2.fillRect(toVisible(p)._1, toVisible(p)._2, 3, 3)
+            g2.fillRect(1064 - toVisible(p)._1, toVisible(p)._2, 3, 5)
           })
 
-          drawPoints(best._2._1, best._2._2, g2, Color.GREEN, Color.CYAN)
-          drawPoints(worst._2._1, worst._2._2, g2, Color.RED, Color.YELLOW)
-          g2.dispose
+          drawPoints(best.path.part1, best.path.part2, g2, Color.GREEN, Color.CYAN)
+          drawPoints(worst.path.part1, worst.path.part2, g2, Color.RED, Color.YELLOW)
+          g2.dispose()
         }
       }
 
