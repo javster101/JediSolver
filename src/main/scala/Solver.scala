@@ -9,6 +9,12 @@ import scala.concurrent.duration.Duration
 import scala.math.pow
 import javax.swing.ImageIcon
 import java.awt.BasicStroke
+import java.util.Calendar
+import java.time.Instant
+import java.time.format.{DateTimeFormatter, FormatStyle}
+import java.time.format.FormatStyle
+import java.util.Locale
+import java.time.ZoneId
 
 object Solver {
   case class Vec2 (
@@ -93,15 +99,13 @@ object Solver {
       .minBy(_.cost)
   }
 
-  def getAll(seedIndex: Int, seedsArray: Array[Int]): (Array[Int], Array[Int]) = {
-    val firstSet = pick(seedIndex, seedsArray);
-    val secondSet = pick(seedIndex + 6, seedsArray);
-
-    (firstSet, secondSet)
-  }
+  def getAll(seedIndex: Int, seedsArray: Array[Int]): (Array[Int], Array[Int]) = 
+    (pick(seedIndex, seedsArray), pick(seedIndex + 6, seedsArray))
 
   def getMinMax(threadIdx: Int, startIdx: Int, endIdx: Int, costs: Array[Double], seedsArray: Array[Int]): (Result, Result) =
   {
+    val percentPrint = 10
+
     val count = endIdx - startIdx
 
     var best: Result = Result((0, 0), optimalPairBySeed(0, costs, seedsArray))
@@ -118,18 +122,46 @@ object Solver {
         worst = Result((x, seedsArray(x)), path)
       }
 
-      if (x % (count / 100) == 0) {
-        println("Worker " + threadIdx + " at " + x + " (" + ((x - startIdx) * 100 / count) + "%)")
+      if (x % (count / percentPrint) == 0) {
+        println("Worker " + threadIdx + " at " + x + 
+          " (" + ((x - startIdx) * 100 / count) + "%)")
       }
     }
 
     (best, worst)
   }
 
-  def main(args: Array[String]): Unit = {
-    val max = 1200;
-    val threadCount = 8
+  def parseOptions(map: Map[String, String], options: List[String]): Map[String, String] = 
+    options match {
+      case Nil => map
+      case "--out" :: outFile :: rest => parseOptions(map ++ Map("output" -> outFile), rest)
+      case "--threads" :: count :: rest => parseOptions(map ++ Map("threadCount" -> count), rest)
+      case "--show" :: show :: rest => parseOptions(map ++ Map("showOutput" -> show), rest)
+      case "--start" :: start :: rest => parseOptions(map ++ Map("start" -> start), rest)
+      case seedCount :: rest => parseOptions(map ++ Map("seedCount" -> seedCount), rest) 
+    }
 
+  def main(args: Array[String]): Unit = {
+    val options = parseOptions(
+      Map("threadCount" -> "4",
+          "showOutput" -> "true",
+          "start" -> "0"),
+        args.toList)
+    
+    val threadCount = options("threadCount").toInt
+    val seedCount = options("seedCount").toInt
+    val start = options("start").toInt
+    
+    println(options)
+
+    val formatter = DateTimeFormatter
+      .ofLocalizedDate(FormatStyle.MEDIUM)
+      .withLocale(Locale.UK)
+      .withZone(ZoneId.systemDefault)
+
+    val startTime = Instant.now()
+
+    println("Starting at" + formatter.format(startTime))
     println("Loading points: ")
 
     val points = Source.fromFile("jedibattleinitial.csv")
@@ -144,10 +176,10 @@ object Solver {
       .toArray
 
     println("Computing seeds")
-    val seeds = new Array[Int](max + 20)
+    val seeds = new Array[Int](start + seedCount + 20)
     seeds(0) = 0;
 
-    for (x <- 1 until max + 20) {
+    for (x <- 1 until start + seedCount + 20) {
       seeds(x) = nextRand(seeds(x-1))
     }
 
@@ -163,7 +195,7 @@ object Solver {
       def reportFailure(t: Throwable): Unit = {}
     }
 
-    val workers = (Range(0, max, max / threadCount) :+ max)
+    val workers = (Range(start, start + seedCount, seedCount / threadCount) :+ (start + seedCount))
       .sliding(2)
       .zipWithIndex
       .map(p => Future { getMinMax(p._2, p._1.head, p._1.last, costsArray, seeds) })
@@ -173,6 +205,11 @@ object Solver {
 
     val best = results.minBy(_._1.path.cost)._1
     val worst = results.maxBy(_._2.path.cost)._2
+
+    val endTime = Instant.now()
+    val runtime = java.time.Duration.between(startTime, endTime)
+
+    println("Finished, calculated optimal path in " + (runtime.getNano.doubleValue) / 100000000 + " seconds")
 
     println()
     println("Best: ")
@@ -231,15 +268,18 @@ object Solver {
           g2.dispose()
         }
       }
+   
 
-    val frame = new JFrame(){
-      setName("JediSolver")
-      setDefaultCloseOperation(WindowConstants.EXIT_ON_CLOSE)
-      setLayout(new BorderLayout)
-      add(createContentPane)
-      pack()
-      setSize(600, 600)
-      setVisible(true)
+    if (options("showOutput").toBoolean) {
+      val frame = new JFrame(){
+        setName("JediSolver")
+        setDefaultCloseOperation(WindowConstants.EXIT_ON_CLOSE)
+        setLayout(new BorderLayout)
+        add(createContentPane)
+        pack()
+        setSize(600, 600)
+        setVisible(true)
+      } 
     }
   }
 }
