@@ -15,6 +15,8 @@ import java.time.format.{DateTimeFormatter, FormatStyle}
 import java.time.format.FormatStyle
 import java.util.Locale
 import java.time.ZoneId
+import java.nio.file.{Files, Path}
+import java.nio.file.Paths
 
 object Solver {
   case class Vec2 (
@@ -39,12 +41,7 @@ object Solver {
 
   def nextRand(seed: Int): Int = {
     var mid: Int = (seed ^ 0x75bd924) * 0x41a7 + ((seed ^ 0x75bd924) / 0x1f31d) * -0x7fffffff;
-
-    if (mid < 0) {
-      mid = mid + 0x7fffffff;
-    }
-
-    mid ^ 0x75bd924;
+    if mid < 0 then (mid + 0x7fffffff) ^ 0x75bd924 else mid ^ 0x75bd924
   }
 
   def pick(seedIndex: Int, seedsArray: Array[Int]): Array[Int] = {
@@ -144,15 +141,16 @@ object Solver {
   def main(args: Array[String]): Unit = {
     val options = parseOptions(
       Map("threadCount" -> "4",
-          "showOutput" -> "true",
-          "start" -> "0"),
+          "showOutput" -> "false",
+          "start" -> "0",
+          "seedCount" -> "1200",
+          "output" -> "out.txt"),
         args.toList)
     
     val threadCount = options("threadCount").toInt
     val seedCount = options("seedCount").toInt
     val start = options("start").toInt
-    
-    println(options)
+    val outPath = Paths.get(options("output"))
 
     val formatter = DateTimeFormatter
       .ofLocalizedDate(FormatStyle.MEDIUM)
@@ -161,7 +159,7 @@ object Solver {
 
     val startTime = Instant.now()
 
-    println("Starting at" + formatter.format(startTime))
+    println("Starting at " + formatter.format(startTime))
     println("Loading points: ")
 
     val points = Source.fromFile("jedibattleinitial.csv")
@@ -211,21 +209,17 @@ object Solver {
 
     println("Finished, calculated optimal path in " + (runtime.getNano.doubleValue) / 100000000 + " seconds")
 
-    println()
-    println("Best: ")
-    println(best.indexData)
+    val out = 
+        "Points (1): " + best.path.part1.map(p => points(p)).mkString("(", ", ", ")") + "\n" + 
+        "Indices (1): " + best.path.part1.mkString(", ") + "\n" + 
+        "Points (2): " + best.path.part2.map(p => points(p)).mkString("(", ", ", ")") + "\n" + 
+        "Indices (2): " + best.path.part2.mkString(", ") + "\n" + 
+        "Cost: " + best.path.cost + 
+        "RNG Index: " + best.indexData._1 + " RNG Value: " + best.indexData._2
 
-    println(best.path.part1.map(p => points(p)).mkString("Array(", ", ", ")"))
-    println(best.path.part2.map(p => points(p)).mkString("Array(", ", ", ")"))
-    println(best.path.cost)
+    println(out)
 
-    println()
-    println("Worst: ")
-    println(worst.indexData)
-
-    println(worst.path.part1.map(p => points(p)).mkString("Array(", ", ", ")"))
-    println(worst.path.part2.map(p => points(p)).mkString("Array(", ", ", ")"))
-    println(worst.path.cost)
+    if (!Files.exists(outPath) || Files.isRegularFile(outPath)) Files.writeString(outPath, out)
 
     def toVisible(point: Vec2): (Int, Int) =
       (((point.x + 11) * 48).asInstanceOf[Int], ((point.y + 11) * 48).asInstanceOf[Int])
