@@ -1,2 +1,2 @@
 # JEDI SOLVER
-Jedi Solver is a program to compute the optimal Jedi Battle RNG.
+Brute-force solver for optimal Jedi Battle RNG for LSW:TCS.
