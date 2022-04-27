@@ -17,6 +17,16 @@ import java.util.Locale
 import java.time.ZoneId
 import java.nio.file.{Files, Path}
 import java.nio.file.Paths
+import org.lwjgl.system.MemoryUtil
+import org.lwjgl.system.MemoryStack
+import scala.util.Using
+import org.lwjgl.opencl.CL10
+import org.lwjgl.opencl.CL
+import java.nio.IntBuffer
+import org.lwjgl.opencl.CLCapabilities
+import scala.util.Try
+import org.lwjgl.opencl.CLProgramCallback
+import java.nio.ByteBuffer
 
 object Solver {
   case class Vec2 (
@@ -24,7 +34,7 @@ object Solver {
     y: Double
   )
 
-  case class Path (
+  case class Solution (
     part1: Array[Int],
     part2: Array[Int],
     cost: Double
@@ -32,7 +42,15 @@ object Solver {
 
   case class Result (
     indexData: (Int, Int),
-    path: Path
+    path: Solution
+  )
+
+  case class CLInfo (
+    platform: Long,
+    capabilities: CLCapabilities,
+    device: Long,
+    context: Long,
+    queue: Long
   )
 
   implicit class PowerInt(val i:Double) extends AnyVal {
@@ -62,7 +80,7 @@ object Solver {
     items
   }
 
-  def distance(p1: Vec2, p2: Vec2): Double = (p1.x - p2.x) ** 2 + (p1.y - p2.y) ** 2
+  def distance(p1: Vec2, p2: Vec2): Double = Math.sqrt((p1.x - p2.x) ** 2 + (p1.y - p2.y) ** 2)
 
   def calculateCost(points: Array[Int], costs: Array[Double]): Double =
     points
@@ -84,7 +102,7 @@ object Solver {
       .view.mapValues(p => p.minBy(_._2))
       .toMap
 
-  def optimalPairBySeed(seedIndex: Int, costs: Array[Double], seedsArray: Array[Int]): Path = {
+  def optimalPairBySeed(seedIndex: Int, costs: Array[Double], seedsArray: Array[Int]): Solution = {
     val paths = getAll(seedIndex, seedsArray)
 
     val firstPath = getPathsByEnding(paths._1, 121, costs)
@@ -92,7 +110,7 @@ object Solver {
     paths._1
       .map(p => (p, getPathsCosts(paths._2, p, costs).minBy(_._2)))
       .map(p => (firstPath(p._1), p._2))
-      .map(p => Path(p._1._1, p._2._1, p._1._2 + p._2._2))
+      .map(p => Solution(p._1._1, p._2._1, p._1._2 + p._2._2))
       .minBy(_.cost)
   }
 
@@ -105,12 +123,12 @@ object Solver {
 
     val count = endIdx - startIdx
 
-    var best: Result = Result((0, 0), optimalPairBySeed(0, costs, seedsArray))
-    var worst: Result = Result((0, 0), optimalPairBySeed(0, costs, seedsArray))
+    var best: Result = Result((0, 0), Solution(Array(), Array(), Double.MaxValue))
+    var worst: Result = Result((0, 0), Solution(Array(), Array(), Double.MaxValue))
 
     for (x <- startIdx until endIdx) {
       val path = optimalPairBySeed(x, costs, seedsArray)
-
+      
       if (path.cost < best.path.cost) {
         best = Result((x, seedsArray(x)), path)
       }
@@ -120,10 +138,178 @@ object Solver {
       }
 
       if (x % (count / percentPrint) == 0) {
-        println("Worker " + threadIdx + " at " + x + 
-          " (" + ((x - startIdx) * 100 / count) + "%)")
+       // println("Worker " + threadIdx + " at " + x + 
+        //  " (" + ((x - startIdx) * 100 / count) + "%)")
       }
     }
+
+    (best, worst)
+  }
+
+  def checkCLError(errcode: IntBuffer): Unit = {
+    checkCLError(errcode.get(errcode.position()));
+  }
+
+  def checkCLError(errcode: Int): Unit = {
+    if (errcode != CL10.CL_SUCCESS) {
+      throw new RuntimeException(String.format("OpenCL error [%d]", errcode));
+    }
+  }
+
+  def getCLDevice(platform: Long, platformCaps: CLCapabilities, deviceType: Int): Try[Long] = Using(MemoryStack.stackPush()) { stack =>  
+    val pi = stack.mallocInt(1);
+    checkCLError(CL10.clGetDeviceIDs(platform, deviceType, null, pi))
+
+    val devices = stack.mallocPointer(pi.get(0))
+    checkCLError(CL10.clGetDeviceIDs(platform, deviceType, devices, null.asInstanceOf[IntBuffer]))
+    devices.get(0)
+  }
+
+  def initializeOpenCL(): Try[CLInfo] = Using(MemoryStack.stackPush()) { stack => 
+    val pi = stack.mallocInt(1)
+    checkCLError(CL10.clGetPlatformIDs(null, pi))
+    if (pi.get(0) == 0) {
+        throw new IllegalStateException("No OpenCL platforms found.");
+    }
+
+    val platformIDs = stack.mallocPointer(pi.get(0))
+    checkCLError(CL10.clGetPlatformIDs(platformIDs, null.asInstanceOf[IntBuffer]))
+
+    val platform = platformIDs.get(0)
+    val clPlatformCapabilities = CL.createPlatformCapabilities(platform)
+    val device = getCLDevice(platform, clPlatformCapabilities, CL10.CL_DEVICE_TYPE_GPU).get
+    val contextProps = MemoryUtil.memAllocPointer(7).put(CL10.CL_CONTEXT_PLATFORM).put(platform).put(0).flip() 
+    val context = CL10.clCreateContext(contextProps, device, (error, privInfo, cb, userData) => println("Error"), 0, pi)
+    checkCLError(pi) 
+    
+    val queue = CL10.clCreateCommandQueue(context, device, 0, pi)
+    checkCLError(pi) 
+
+    CLInfo(platform, clPlatformCapabilities, device, context, queue)
+  }
+  
+  def getProgramString(program: Long, device: Long, param: Int): Try[String] = Using(MemoryStack.stackPush()) { stack => 
+    val pp = stack.mallocPointer(1)
+    checkCLError(CL10.clGetProgramBuildInfo(program, device, param, null.asInstanceOf[ByteBuffer], pp));
+    
+    val bytes = pp.get(0).asInstanceOf[Int]
+    val buffer = stack.malloc(bytes)
+    checkCLError(CL10.clGetProgramBuildInfo(program, device, param, buffer, null))
+
+    MemoryUtil.memASCII(buffer, bytes - 1)
+  }
+
+  def computeGPU(start: Int, seedCount: Int, points: List[Vec2], seeds: Array[Int]): (Result, Result) = {
+    val openCL = initializeOpenCL().get
+    
+    val err = MemoryUtil.memAllocInt(1)
+    val program = CL10.clCreateProgramWithSource(openCL.context, Files.readString(Path.of("src/main/opencl/kernel.cl")), err)
+    val constructed = CL10.clBuildProgram(program, openCL.device, "", CLProgramCallback.create((p, u) => println("Building")), 0)
+    println("Kernel compilation returned " + getProgramString( program, openCL.device, CL10.CL_PROGRAM_BUILD_LOG))
+    
+    val kernel = CL10.clCreateKernel(program, "brute", err)
+    checkCLError(err)
+
+    val permutations = 
+      Seq(0,1,2,3,4,5)
+      .permutations.toList
+      .sortBy(_.last)
+      .map(_.take(5))
+
+    val permutationBuffer = MemoryUtil.memAlloc(permutations.length * permutations(0).length)
+    permutations.foreach(p => p.foreach(i => permutationBuffer.put(i.asInstanceOf[Byte])))
+    permutationBuffer.flip()
+
+    val allPoints = Range(start, seedCount, 1)
+      .map(getAll(_, seeds))
+      .map(p => p._1 ++ p._2)
+      .flatMap(p => p.map(points(_))) 
+
+    val pointsBuffer = MemoryUtil.memAllocFloat(allPoints.length * 2)
+    allPoints.foreach(p => pointsBuffer.put(p._1.asInstanceOf[Float]).put(p._2.asInstanceOf[Float]))
+    pointsBuffer.flip()
+    
+    val permuteMemory = CL10.clCreateBuffer(openCL.context, CL10.CL_MEM_WRITE_ONLY | CL10.CL_MEM_COPY_HOST_PTR, permutationBuffer, err)
+    checkCLError(err)
+
+    val pointsMemory = CL10.clCreateBuffer(openCL.context, CL10.CL_MEM_WRITE_ONLY | CL10.CL_MEM_COPY_HOST_PTR, pointsBuffer, err)
+    checkCLError(err)
+
+    val resultMemory = CL10.clCreateBuffer(openCL.context, CL10.CL_MEM_WRITE_ONLY, seedCount * 4 * 6 * 2, err)
+    checkCLError(err)
+
+    val idMemory = CL10.clCreateBuffer(openCL.context, CL10.CL_MEM_WRITE_ONLY, seedCount * 6 * 2 * 2, err)
+    checkCLError(err)
+    
+    CL10.clSetKernelArg1p(kernel, 0, permuteMemory)
+    CL10.clSetKernelArg1p(kernel, 1, pointsMemory)
+    CL10.clSetKernelArg1p(kernel, 2, resultMemory)
+    CL10.clSetKernelArg1p(kernel, 3, idMemory)
+    CL10.clSetKernelArg1i(kernel, 4, seedCount)
+
+    val workSize = MemoryUtil.memAllocPointer(3)
+    workSize.put(0, seedCount * 120)
+    workSize.put(1, 6)
+    workSize.put(2, 2)
+
+    val localWorkSize = MemoryUtil.memAllocPointer(3)
+    localWorkSize.put(0, 120)
+    localWorkSize.put(1, 1)
+    localWorkSize.put(2, 1)
+
+    checkCLError(CL10.clEnqueueNDRangeKernel(openCL.queue, kernel, 3, null, workSize, localWorkSize, null, null))
+    
+    val resultBuffer = MemoryUtil.memAllocFloat(seedCount * 6 * 2)
+    val idBuffer = MemoryUtil.memAllocShort(seedCount * 6 * 2)
+    
+    checkCLError(CL10.clEnqueueReadBuffer(openCL.queue, resultMemory, true, 0, resultBuffer, null, null))
+    checkCLError(CL10.clEnqueueReadBuffer(openCL.queue, idMemory, true, 0, idBuffer, null, null))
+   
+    val values = Range(0, seedCount, 1)
+      .map(seed => 
+        (for (firstPath <- 0 until 6; secondPath <- 0 until 6) yield (firstPath, secondPath, 
+          resultBuffer.get(seed * 12 + firstPath) + 
+          resultBuffer.get(seed * 12 + secondPath + 6) + 
+          distance(allPoints(seed * 12 + firstPath), allPoints(seed * 12 + secondPath + 6)))).minBy(_._3))
+        .zipWithIndex
+    
+    val min = values.minBy(_._1._3)  
+    val max = values.maxBy(_._1._3)
+
+    println(idBuffer.get(min._2 * 12 + min._1._2 + 6))
+    
+    val minFirstPoints  = Vec2(5.15, -5.0) +: permutations(idBuffer.get(min._2 * 12 + min._1._1) / 5).map(idx => allPoints(min._2 * 12 + idx)) :+ allPoints(min._2 * 12 + min._1._1)
+    val minSecondPoints = List(allPoints(min._2 * 12 + min._1._1), allPoints(min._2 * 12 + min._1._2 + 6)) ++ permutations(idBuffer.get(min._2 * 12 + min._1._2 + 6) / 5).reverse.map(idx => allPoints(min._2 * 12 + idx + 6))
+    
+    val maxFirstPoints  = Vec2(5.15, -5.0) +: permutations(idBuffer.get(max._2 * 12 + max._1._1) / 5).map(idx => allPoints(max._2 * 12 + idx)) :+ allPoints(max._2 * 12 + max._1._1)
+    val maxSecondPoints = allPoints(max._2 * 12 + max._1._1) +: permutations(idBuffer.get(max._2 * 12 + max._1._2 + 6) / 5).reverse.map(idx => allPoints(max._2 * 12 + idx + 6))
+
+    (Result((start + min._2, seeds(start + min._2)), Solution(minFirstPoints.map(points.indexOf(_)).toArray, minSecondPoints.map(points.indexOf(_)).toArray, min._1._3)),
+     Result((start + max._2, seeds(start + max._2)), Solution(maxFirstPoints.map(points.indexOf(_)).toArray, maxSecondPoints.map(points.indexOf(_)).toArray, max._1._3)))
+  }
+
+
+  def computeLocal(threadCount: Int, start: Int, seedCount: Int, costsArray: Array[Double], seeds: Array[Int]): (Result, Result) = {
+    implicit val ec: ExecutionContext = new ExecutionContext {
+      val threadPool: ExecutorService = Executors.newFixedThreadPool(threadCount)
+
+      def execute(runnable: Runnable): Unit = {
+        threadPool.submit(runnable)
+      }
+
+      def reportFailure(t: Throwable): Unit = {}
+    }
+
+    val workers = (Range(start, start + seedCount, seedCount / threadCount) :+ (start + seedCount))
+      .sliding(2)
+      .zipWithIndex
+      .map(p => Future { getMinMax(p._2, p._1.head, p._1.last, costsArray, seeds) })
+
+    val work = Future.sequence(workers)
+    val results = Await.result(work, Duration.Inf).toSeq
+
+    val best = results.minBy(_._1.path.cost)._1
+    val worst = results.maxBy(_._2.path.cost)._2
 
     (best, worst)
   }
@@ -140,18 +326,20 @@ object Solver {
 
   def main(args: Array[String]): Unit = {
     val options = parseOptions(
-      Map("threadCount" -> "4",
-          "showOutput" -> "false",
+      Map("threadCount" -> "8",
+          "showOutput" -> "true",
           "start" -> "0",
-          "seedCount" -> "1200",
-          "output" -> "out.txt"),
+          "seedCount" -> "10000000",
+          "output" -> "out.txt",
+          "gpu" -> "true"),
         args.toList)
     
-    val threadCount = options("threadCount").toInt
     val seedCount = options("seedCount").toInt
+    val threadCount = Math.min(seedCount, options("threadCount").toInt)
     val start = options("start").toInt
-    val outPath = Paths.get(options("output"))
-
+    val outPath = Path.of(options("output"))
+    val gpu = options("gpu").toBoolean
+    
     val formatter = DateTimeFormatter
       .ofLocalizedDate(FormatStyle.MEDIUM)
       .withLocale(Locale.UK)
@@ -182,31 +370,28 @@ object Solver {
     }
 
     println("Calculating paths")
+   
+    val gpuStartTime = System.nanoTime()
+    val gpuResult = computeGPU(start, seedCount, points, seeds)
+    val gpuEndTime = System.nanoTime()
 
-    implicit val ec: ExecutionContext = new ExecutionContext {
-      val threadPool: ExecutorService = Executors.newFixedThreadPool(threadCount)
+    println("GPU complete")
 
-      def execute(runnable: Runnable): Unit = {
-        threadPool.submit(runnable)
-      }
+  //  val cpuStartTime = System.nanoTime()
+  //  val cpuResult = computeLocal(threadCount, start, seedCount, costsArray, seeds)
+  //  val cpuEndTime = System.nanoTime()
 
-      def reportFailure(t: Throwable): Unit = {}
-    }
+  //  if (!(gpuResult._1._2._1.sameElements(cpuResult._1._2._1))) println("First parts don't match")
+  //  if (!(gpuResult._1._2._2.sameElements(cpuResult._1._2._2))) println("Second parts don't match")
 
-    val workers = (Range(start, start + seedCount, seedCount / threadCount) :+ (start + seedCount))
-      .sliding(2)
-      .zipWithIndex
-      .map(p => Future { getMinMax(p._2, p._1.head, p._1.last, costsArray, seeds) })
+    val best = gpuResult._1
+    val worst = gpuResult._2
 
-    val work = Future.sequence(workers)
-    val results = Await.result(work, Duration.Inf).toSeq
-
-    val best = results.minBy(_._1.path.cost)._1
-    val worst = results.maxBy(_._2.path.cost)._2
+   // println("GPU took " + (gpuEndTime - gpuStartTime) / 100000000 + " seconds")
+    //println("CPU took " + (cpuEndTime - cpuStartTime) / 100000000 + " seconds")
 
     val endTime = Instant.now()
     val runtime = java.time.Duration.between(startTime, endTime)
-
     println("Finished, calculated optimal path in " + (runtime.getNano.doubleValue) / 100000000 + " seconds")
 
     val out = 
@@ -253,12 +438,15 @@ object Solver {
 
           g2.drawImage(image, 0, 0, null)
 
+          drawPoints(best.path.part1, best.path.part2, g2, Color.GREEN, Color.CYAN)
+          
+          g2.setColor(Color.BLACK)
+          g2.setBackground(Color.BLACK)
           points.foreach(p => {
             g2.fillRect(1064 - toVisible(p)._1, toVisible(p)._2, 3, 5)
           })
 
-          drawPoints(best.path.part1, best.path.part2, g2, Color.GREEN, Color.CYAN)
-          drawPoints(worst.path.part1, worst.path.part2, g2, Color.RED, Color.YELLOW)
+          //drawPoints(worst.path.part1, worst.path.part2, g2, Color.RED, Color.YELLOW)
           g2.dispose()
         }
       }
