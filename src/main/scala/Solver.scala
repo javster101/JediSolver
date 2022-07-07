@@ -27,6 +27,8 @@ import org.lwjgl.opencl.CLCapabilities
 import scala.util.Try
 import org.lwjgl.opencl.CLProgramCallback
 import java.nio.ByteBuffer
+import java.awt.image.BufferedImage
+import java.io.File
 
 object Solver {
   case class Vec2 (
@@ -199,7 +201,7 @@ object Solver {
     MemoryUtil.memASCII(buffer, bytes - 1)
   }
 
-  def computeGPU(start: Int, seedCount: Int, points: List[Vec2], seeds: Array[Int]): (Result, Result) = {
+  def computeGPU(start: Int, seedCount: Int, seedsPerKernel: Int, points: List[Vec2], seeds: Array[Int]): (Result, Result) = {
     val openCL = initializeOpenCL().get
     
     val err = MemoryUtil.memAllocInt(1)
@@ -220,7 +222,25 @@ object Solver {
     permutations.foreach(p => p.foreach(i => permutationBuffer.put(i.asInstanceOf[Byte])))
     permutationBuffer.flip()
 
-    val allPoints = Range(start, seedCount, 1)
+    val permuteMemory = CL10.clCreateBuffer(openCL.context, CL10.CL_MEM_WRITE_ONLY | CL10.CL_MEM_COPY_HOST_PTR, permutationBuffer, err)
+    checkCLError(err)
+
+    val tasksNeeded = Math.max(seedCount / seedsPerKernel, 1)
+    val tasks = (Range(start, start + seedCount, seedCount / tasksNeeded) :+ (start + seedCount)).sliding(2).toList
+    
+    println("Computing in " + tasks.length + " tasks")
+    
+    val results = tasks.map(t => computeGPUIndividual(t.head, t.last - t.head, points, seeds, permutations, permuteMemory, kernel, openCL))
+   
+    (results.map(r => r._1).minBy(m => m.path.cost), results.map(r => r._2).maxBy(m => m.path.cost))
+  }
+
+  def computeGPUIndividual(start: Int, seedCount: Int, points: List[Vec2], seeds: Array[Int], permutations: List[Seq[Int]], permutationBuffer: Long, kernel: Long, openCL: CLInfo): (Result, Result) = {
+    val err = MemoryUtil.memAllocInt(1)
+    
+
+    println("Computing " + start + " to " + (start + seedCount))
+    val allPoints = Range(start, start + seedCount, 1)
       .map(getAll(_, seeds))
       .map(p => p._1 ++ p._2)
       .flatMap(p => p.map(points(_))) 
@@ -229,9 +249,6 @@ object Solver {
     allPoints.foreach(p => pointsBuffer.put(p._1.asInstanceOf[Float]).put(p._2.asInstanceOf[Float]))
     pointsBuffer.flip()
     
-    val permuteMemory = CL10.clCreateBuffer(openCL.context, CL10.CL_MEM_WRITE_ONLY | CL10.CL_MEM_COPY_HOST_PTR, permutationBuffer, err)
-    checkCLError(err)
-
     val pointsMemory = CL10.clCreateBuffer(openCL.context, CL10.CL_MEM_WRITE_ONLY | CL10.CL_MEM_COPY_HOST_PTR, pointsBuffer, err)
     checkCLError(err)
 
@@ -241,7 +258,7 @@ object Solver {
     val idMemory = CL10.clCreateBuffer(openCL.context, CL10.CL_MEM_WRITE_ONLY, seedCount * 6 * 2 * 2, err)
     checkCLError(err)
     
-    CL10.clSetKernelArg1p(kernel, 0, permuteMemory)
+    CL10.clSetKernelArg1p(kernel, 0, permutationBuffer)
     CL10.clSetKernelArg1p(kernel, 1, pointsMemory)
     CL10.clSetKernelArg1p(kernel, 2, resultMemory)
     CL10.clSetKernelArg1p(kernel, 3, idMemory)
@@ -275,14 +292,22 @@ object Solver {
     
     val min = values.minBy(_._1._3)  
     val max = values.maxBy(_._1._3)
-
-    println(idBuffer.get(min._2 * 12 + min._1._2 + 6))
     
     val minFirstPoints  = Vec2(5.15, -5.0) +: permutations(idBuffer.get(min._2 * 12 + min._1._1) / 5).map(idx => allPoints(min._2 * 12 + idx)) :+ allPoints(min._2 * 12 + min._1._1)
     val minSecondPoints = List(allPoints(min._2 * 12 + min._1._1), allPoints(min._2 * 12 + min._1._2 + 6)) ++ permutations(idBuffer.get(min._2 * 12 + min._1._2 + 6) / 5).reverse.map(idx => allPoints(min._2 * 12 + idx + 6))
     
     val maxFirstPoints  = Vec2(5.15, -5.0) +: permutations(idBuffer.get(max._2 * 12 + max._1._1) / 5).map(idx => allPoints(max._2 * 12 + idx)) :+ allPoints(max._2 * 12 + max._1._1)
-    val maxSecondPoints = allPoints(max._2 * 12 + max._1._1) +: permutations(idBuffer.get(max._2 * 12 + max._1._2 + 6) / 5).reverse.map(idx => allPoints(max._2 * 12 + idx + 6))
+    val maxSecondPoints = List(allPoints(max._2 * 12 + max._1._1), allPoints(max._2 * 12 + max._1._2 + 6)) ++ permutations(idBuffer.get(max._2 * 12 + max._1._2 + 6) / 5).reverse.map(idx => allPoints(max._2 * 12 + idx + 6))
+    
+    checkCLError(CL10.clReleaseMemObject(pointsMemory))
+    checkCLError(CL10.clReleaseMemObject(resultMemory))
+    checkCLError(CL10.clReleaseMemObject(idMemory))
+
+    MemoryUtil.memFree(pointsBuffer)
+    MemoryUtil.memFree(resultBuffer)
+    MemoryUtil.memFree(idBuffer)
+    
+    println("Computed " + start + " to " + (start + seedCount))
 
     (Result((start + min._2, seeds(start + min._2)), Solution(minFirstPoints.map(points.indexOf(_)).toArray, minSecondPoints.map(points.indexOf(_)).toArray, min._1._3)),
      Result((start + max._2, seeds(start + max._2)), Solution(maxFirstPoints.map(points.indexOf(_)).toArray, maxSecondPoints.map(points.indexOf(_)).toArray, max._1._3)))
@@ -321,6 +346,7 @@ object Solver {
       case "--threads" :: count :: rest => parseOptions(map ++ Map("threadCount" -> count), rest)
       case "--show" :: show :: rest => parseOptions(map ++ Map("showOutput" -> show), rest)
       case "--start" :: start :: rest => parseOptions(map ++ Map("start" -> start), rest)
+      case "--kernelSize" :: start :: rest => parseOptions(map ++ Map("seedsPerKernel" -> start), rest)
       case seedCount :: rest => parseOptions(map ++ Map("seedCount" -> seedCount), rest) 
     }
 
@@ -330,6 +356,7 @@ object Solver {
           "showOutput" -> "true",
           "start" -> "0",
           "seedCount" -> "10000000",
+          "seedsPerKernel" -> "1000000",
           "output" -> "out.txt",
           "gpu" -> "true"),
         args.toList)
@@ -339,6 +366,7 @@ object Solver {
     val start = options("start").toInt
     val outPath = Path.of(options("output"))
     val gpu = options("gpu").toBoolean
+    val seedsPerKernel = options("seedsPerKernel").toInt
     
     val formatter = DateTimeFormatter
       .ofLocalizedDate(FormatStyle.MEDIUM)
@@ -368,11 +396,10 @@ object Solver {
     for (x <- 1 until start + seedCount + 20) {
       seeds(x) = nextRand(seeds(x-1))
     }
-
     println("Calculating paths")
    
     val gpuStartTime = System.nanoTime()
-    val gpuResult = computeGPU(start, seedCount, points, seeds)
+    val gpuResult = computeGPU(start, seedCount, seedsPerKernel, points, seeds)
     val gpuEndTime = System.nanoTime()
 
     println("GPU complete")
@@ -381,11 +408,8 @@ object Solver {
   //  val cpuResult = computeLocal(threadCount, start, seedCount, costsArray, seeds)
   //  val cpuEndTime = System.nanoTime()
 
-  //  if (!(gpuResult._1._2._1.sameElements(cpuResult._1._2._1))) println("First parts don't match")
-  //  if (!(gpuResult._1._2._2.sameElements(cpuResult._1._2._2))) println("Second parts don't match")
-
-    val best = gpuResult._1
-    val worst = gpuResult._2
+    val best = gpuResult._2
+    val worst = gpuResult._1
 
    // println("GPU took " + (gpuEndTime - gpuStartTime) / 100000000 + " seconds")
     //println("CPU took " + (cpuEndTime - cpuStartTime) / 100000000 + " seconds")
@@ -422,35 +446,45 @@ object Solver {
         g2.drawLine(1064 - toVisible(points(ps.head))._1, toVisible(points(ps.head))._2, 1064 - toVisible(points(ps.last))._1, toVisible(points(ps.last))._2)
       })
     }
+  
+    val image: Image = new ImageIcon("background.png").getImage
+    def paintFrame(g: Graphics): Unit = {
+      val g2 = g.create.asInstanceOf[Graphics2D]
+      g2.setStroke(new BasicStroke(4))
+
+      g2.setColor(Color.BLACK)
+      g2.setBackground(Color.BLACK)
+      g2.clearRect(0, 0, 6000, 6000)
+
+      g2.drawImage(image, 0, 0, null)
+
+      drawPoints(best.path.part1, best.path.part2, g2, Color.GREEN, Color.CYAN)
+      
+      g2.setColor(Color.BLACK)
+      g2.setBackground(Color.BLACK)
+      points.foreach(p => {
+        g2.fillRect(1064 - toVisible(p)._1, toVisible(p)._2, 3, 5)
+      })
+
+      //drawPoints(worst.path.part1, worst.path.part2, g2, Color.RED, Color.YELLOW)
+      g2.dispose()
+    }
 
     def createContentPane =
       new JComponent {
-        val image: Image = new ImageIcon("background.png").getImage
         override def paintComponent(g: Graphics): Unit = {
           super.paintComponent(g)
 
-          val g2 = g.create.asInstanceOf[Graphics2D]
-          g2.setStroke(new BasicStroke(4))
-
-          g2.setColor(Color.BLACK)
-          g2.setBackground(Color.BLACK)
-          g2.clearRect(0, 0, 6000, 6000)
-
-          g2.drawImage(image, 0, 0, null)
-
-          drawPoints(best.path.part1, best.path.part2, g2, Color.GREEN, Color.CYAN)
-          
-          g2.setColor(Color.BLACK)
-          g2.setBackground(Color.BLACK)
-          points.foreach(p => {
-            g2.fillRect(1064 - toVisible(p)._1, toVisible(p)._2, 3, 5)
-          })
-
-          //drawPoints(worst.path.part1, worst.path.part2, g2, Color.RED, Color.YELLOW)
-          g2.dispose()
+          paintFrame(g) 
         }
       }
    
+
+  
+    val outImage = new BufferedImage(1064, 1064, BufferedImage.TYPE_INT_ARGB);
+    val graphics = outImage.createGraphics()
+    paintFrame(graphics)
+    javax.imageio.ImageIO.write(outImage, "PNG", new File("test.png"));
 
     if (options("showOutput").toBoolean) {
       val frame = new JFrame(){
