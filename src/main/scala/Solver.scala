@@ -201,7 +201,7 @@ object Solver {
     MemoryUtil.memASCII(buffer, bytes - 1)
   }
 
-  def computeGPU(start: Int, seedCount: Int, seedsPerKernel: Int, points: List[Vec2], seeds: Array[Int]): (Result, Result) = {
+  def computeGPU(start: Int, seedCount: Int, seedsPerKernel: Int, points: List[Vec2], seeds: Array[Int], resultCount: Int): (List[Result], List[Result]) = {
     val openCL = initializeOpenCL().get
     
     val err = MemoryUtil.memAllocInt(1)
@@ -228,14 +228,14 @@ object Solver {
     val tasksNeeded = Math.max(seedCount / seedsPerKernel, 1)
     val tasks = (Range(start, start + seedCount, seedCount / tasksNeeded) :+ (start + seedCount)).sliding(2).toList
     
-    println("Computing in " + tasks.length + " tasks")
+    println("Computing in " + tasks.length + " task(s)")
     
-    val results = tasks.map(t => computeGPUIndividual(t.head, t.last - t.head, points, seeds, permutations, permuteMemory, kernel, openCL))
+    val results = tasks.map(t => computeGPUIndividual(t.head, t.last - t.head, points, seeds, permutations, permuteMemory, kernel, openCL, resultCount))
    
-    (results.map(r => r._1).minBy(m => m.path.cost), results.map(r => r._2).maxBy(m => m.path.cost))
+    (results.flatMap(r => r._1).sortBy(m => m.path.cost).take(resultCount), results.flatMap(r => r._2).sortBy(m => -m.path.cost).take(resultCount))
   }
 
-  def computeGPUIndividual(start: Int, seedCount: Int, points: List[Vec2], seeds: Array[Int], permutations: List[Seq[Int]], permutationBuffer: Long, kernel: Long, openCL: CLInfo): (Result, Result) = {
+  def computeGPUIndividual(start: Int, seedCount: Int, points: List[Vec2], seeds: Array[Int], permutations: List[Seq[Int]], permutationBuffer: Long, kernel: Long, openCL: CLInfo, resultCount: Int): (List[Result], List[Result]) = {
     val err = MemoryUtil.memAllocInt(1)
     
 
@@ -290,15 +290,27 @@ object Solver {
           distance(allPoints(seed * 12 + firstPath), allPoints(seed * 12 + secondPath + 6)))).minBy(_._3))
         .zipWithIndex
     
-    val min = values.minBy(_._1._3)  
-    val max = values.maxBy(_._1._3)
+    val sorted = values.sortBy(_._1._3)  
     
-    val minFirstPoints  = Vec2(5.15, -5.0) +: permutations(idBuffer.get(min._2 * 12 + min._1._1) / 5).map(idx => allPoints(min._2 * 12 + idx)) :+ allPoints(min._2 * 12 + min._1._1)
-    val minSecondPoints = List(allPoints(min._2 * 12 + min._1._1), allPoints(min._2 * 12 + min._1._2 + 6)) ++ permutations(idBuffer.get(min._2 * 12 + min._1._2 + 6) / 5).reverse.map(idx => allPoints(min._2 * 12 + idx + 6))
+    val mins = for (x <- 0 until Math.min(resultCount, values.length)) yield {
+
+      val min = sorted(x)
     
-    val maxFirstPoints  = Vec2(5.15, -5.0) +: permutations(idBuffer.get(max._2 * 12 + max._1._1) / 5).map(idx => allPoints(max._2 * 12 + idx)) :+ allPoints(max._2 * 12 + max._1._1)
-    val maxSecondPoints = List(allPoints(max._2 * 12 + max._1._1), allPoints(max._2 * 12 + max._1._2 + 6)) ++ permutations(idBuffer.get(max._2 * 12 + max._1._2 + 6) / 5).reverse.map(idx => allPoints(max._2 * 12 + idx + 6))
+      val minFirstPoints  = Vec2(5.15, -5.0) +: permutations(idBuffer.get(min._2 * 12 + min._1._1) / 5).map(idx => allPoints(min._2 * 12 + idx)) :+ allPoints(min._2 * 12 + min._1._1)
+      val minSecondPoints = List(allPoints(min._2 * 12 + min._1._1), allPoints(min._2 * 12 + min._1._2 + 6)) ++ permutations(idBuffer.get(min._2 * 12 + min._1._2 + 6) / 5).reverse.map(idx => allPoints(min._2 * 12 + idx + 6))
+      
+      Result((start + min._2, seeds(start + min._2)), Solution(minFirstPoints.map(points.indexOf(_)).toArray, minSecondPoints.map(points.indexOf(_)).toArray, min._1._3))
+    }
+
+    val maxs = for (x <- (values.length - resultCount until values.length).reverse) yield {
+      val max = sorted(x)
     
+      val maxFirstPoints  = Vec2(5.15, -5.0) +: permutations(idBuffer.get(max._2 * 12 + max._1._1) / 5).map(idx => allPoints(max._2 * 12 + idx)) :+ allPoints(max._2 * 12 + max._1._1)
+      val maxSecondPoints = List(allPoints(max._2 * 12 + max._1._1), allPoints(max._2 * 12 + max._1._2 + 6)) ++ permutations(idBuffer.get(max._2 * 12 + max._1._2 + 6) / 5).reverse.map(idx => allPoints(max._2 * 12 + idx + 6))
+    
+      Result((start + max._2, seeds(start + max._2)), Solution(maxFirstPoints.map(points.indexOf(_)).toArray, maxSecondPoints.map(points.indexOf(_)).toArray, max._1._3))
+    }
+
     checkCLError(CL10.clReleaseMemObject(pointsMemory))
     checkCLError(CL10.clReleaseMemObject(resultMemory))
     checkCLError(CL10.clReleaseMemObject(idMemory))
@@ -309,8 +321,7 @@ object Solver {
     
     println("Computed " + start + " to " + (start + seedCount))
 
-    (Result((start + min._2, seeds(start + min._2)), Solution(minFirstPoints.map(points.indexOf(_)).toArray, minSecondPoints.map(points.indexOf(_)).toArray, min._1._3)),
-     Result((start + max._2, seeds(start + max._2)), Solution(maxFirstPoints.map(points.indexOf(_)).toArray, maxSecondPoints.map(points.indexOf(_)).toArray, max._1._3)))
+    (mins.toList, maxs.toList)
   }
 
 
@@ -342,34 +353,53 @@ object Solver {
   def parseOptions(map: Map[String, String], options: List[String]): Map[String, String] = 
     options match {
       case Nil => map
-      case "--out" :: outFile :: rest => parseOptions(map ++ Map("output" -> outFile), rest)
-      case "--threads" :: count :: rest => parseOptions(map ++ Map("threadCount" -> count), rest)
-      case "--show" :: show :: rest => parseOptions(map ++ Map("showOutput" -> show), rest)
-      case "--start" :: start :: rest => parseOptions(map ++ Map("start" -> start), rest)
-      case "--kernelSize" :: start :: rest => parseOptions(map ++ Map("seedsPerKernel" -> start), rest)
+      case ("--out" | "-o") :: outFile :: rest => parseOptions(map ++ Map("output" -> outFile), rest)
+      case ("--preview" | "-p") :: rest => parseOptions(map ++ Map("showOutput" -> "true"), rest)
+      case ("--startIndex" | "-i") :: start :: rest => parseOptions(map ++ Map("start" -> start), rest)
+      case ("--startSeed" | "-s") :: startSeed :: rest => parseOptions(map ++ Map("startSeed" -> startSeed), rest)
+      case ("--kernelSize" | "-k") :: size :: rest => parseOptions(map ++ Map("seedsPerKernel" -> size), rest)
+      case ("--outputCount" | "-c") :: count :: rest => parseOptions(map ++ Map("resultCount" -> count), rest)
+      case ("--generateAll" | "-g") :: rest => parseOptions(map ++ Map("showAll" -> "true"), rest)
       case seedCount :: rest => parseOptions(map ++ Map("seedCount" -> seedCount), rest) 
     }
 
   def main(args: Array[String]): Unit = {
     val options = parseOptions(
-      Map("threadCount" -> "8",
-          "showOutput" -> "true",
+      Map("showOutput" -> "true",
           "start" -> "0",
-          "seedCount" -> "10000000",
+          "startSeed" -> "0",
+          "seedCount" -> "10000",
           "seedsPerKernel" -> "1000000",
-          "output" -> "out.txt",
-          "gpu" -> "true"),
+          "output" -> "./",
+          "resultCount" -> "1",
+          "dumpAll" -> "false"),
         args.toList)
     
     val seedCount = options("seedCount").toInt
-    val threadCount = Math.min(seedCount, options("threadCount").toInt)
     val start = options("start").toInt
+    val startSeed = options("startSeed").toInt
     val outPath = Path.of(options("output"))
-    val gpu = options("gpu").toBoolean
     val seedsPerKernel = options("seedsPerKernel").toInt
-    
+    val dumpAll = options("dumpAll").toBoolean
+    val resultCount = if dumpAll then seedCount else options("resultCount").toInt
+   
+    if (seedsPerKernel <= 0) {
+      println("Kernel size must be larger than 0")
+      return
+    }
+
+    if (seedCount <= 0) {
+      println("Seed count must be larger than 0")
+      return
+    }
+
+    if (resultCount > seedCount || resultCount <= 0) {
+      println(s"Result count of $resultCount must be between 1 and $seedCount")
+      return
+    }
+
     val formatter = DateTimeFormatter
-      .ofLocalizedDate(FormatStyle.MEDIUM)
+      .ofLocalizedDateTime(FormatStyle.MEDIUM)
       .withLocale(Locale.UK)
       .withZone(ZoneId.systemDefault)
 
@@ -391,7 +421,7 @@ object Solver {
 
     println("Computing seeds")
     val seeds = new Array[Int](start + seedCount + 20)
-    seeds(0) = 0;
+    seeds(0) = startSeed;
 
     for (x <- 1 until start + seedCount + 20) {
       seeds(x) = nextRand(seeds(x-1))
@@ -399,26 +429,19 @@ object Solver {
     println("Calculating paths")
    
     val gpuStartTime = System.nanoTime()
-    val gpuResult = computeGPU(start, seedCount, seedsPerKernel, points, seeds)
+    val gpuResult = computeGPU(start, seedCount, seedsPerKernel, points, seeds, resultCount)
     val gpuEndTime = System.nanoTime()
-
-    println("GPU complete")
-
-  //  val cpuStartTime = System.nanoTime()
-  //  val cpuResult = computeLocal(threadCount, start, seedCount, costsArray, seeds)
-  //  val cpuEndTime = System.nanoTime()
-
-    val best = gpuResult._2
-    val worst = gpuResult._1
-
-   // println("GPU took " + (gpuEndTime - gpuStartTime) / 100000000 + " seconds")
-    //println("CPU took " + (cpuEndTime - cpuStartTime) / 100000000 + " seconds")
+    println("GPU took " + (gpuEndTime - gpuStartTime) / 100000000 + " seconds")
 
     val endTime = Instant.now()
     val runtime = java.time.Duration.between(startTime, endTime)
     println("Finished, calculated optimal path in " + (runtime.getNano.doubleValue) / 100000000 + " seconds")
+    
+    for (i <- 0 until resultCount) {
+      val best = gpuResult._1(i)
 
-    val out = 
+      val out = 
+        "Result #" + i + "\n" + 
         "Points (1): " + best.path.part1.map(p => points(p)).mkString("(", ", ", ")") + "\n" + 
         "Indices (1): " + best.path.part1.mkString(", ") + "\n" + 
         "Points (2): " + best.path.part2.map(p => points(p)).mkString("(", ", ", ")") + "\n" + 
@@ -426,13 +449,14 @@ object Solver {
         "Cost: " + best.path.cost + 
         "RNG Index: " + best.indexData._1 + " RNG Value: " + best.indexData._2
 
-    println(out)
+      println(out)
 
-    if (!Files.exists(outPath) || Files.isRegularFile(outPath)) Files.writeString(outPath, out)
+      if (Files.isDirectory(outPath)) Files.writeString(outPath.resolve(best.indexData._2 + ".txt"), out)
+    }
+    
 
     def toVisible(point: Vec2): (Int, Int) =
       (((point.x + 11) * 48).asInstanceOf[Int], ((point.y + 11) * 48).asInstanceOf[Int])
-
 
     def drawPoints(p1: Seq[Int], p2: Seq[Int], g2: Graphics2D, c1: Color, c2: Color): Unit = {
 
@@ -448,7 +472,7 @@ object Solver {
     }
   
     val image: Image = new ImageIcon("background.png").getImage
-    def paintFrame(g: Graphics): Unit = {
+    def paintFrame(g: Graphics, result: Result): Unit = {
       val g2 = g.create.asInstanceOf[Graphics2D]
       g2.setStroke(new BasicStroke(4))
 
@@ -458,7 +482,7 @@ object Solver {
 
       g2.drawImage(image, 0, 0, null)
 
-      drawPoints(best.path.part1, best.path.part2, g2, Color.GREEN, Color.CYAN)
+      drawPoints(result.path.part1, result.path.part2, g2, Color.GREEN, Color.CYAN)
       
       g2.setColor(Color.BLACK)
       g2.setBackground(Color.BLACK)
@@ -474,18 +498,19 @@ object Solver {
       new JComponent {
         override def paintComponent(g: Graphics): Unit = {
           super.paintComponent(g)
-
-          paintFrame(g) 
+          paintFrame(g, gpuResult._1(0)) 
         }
       }
    
 
-  
-    val outImage = new BufferedImage(1064, 1064, BufferedImage.TYPE_INT_ARGB);
-    val graphics = outImage.createGraphics()
-    paintFrame(graphics)
-    javax.imageio.ImageIO.write(outImage, "PNG", new File("test.png"));
+    for (result <- gpuResult._1) {
+      val outImage = new BufferedImage(1064, 1064, BufferedImage.TYPE_INT_ARGB);
+      val graphics = outImage.createGraphics()
+      paintFrame(graphics, result)
+      javax.imageio.ImageIO.write(outImage, "PNG", outPath.resolve(result.indexData._2 + ".png").toFile);
+    }
 
+    
     if (options("showOutput").toBoolean) {
       val frame = new JFrame(){
         setName("JediSolver")
