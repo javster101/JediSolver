@@ -64,6 +64,17 @@ object Solver {
     if mid < 0 then (mid + 0x7fffffff) ^ 0x75bd924 else mid ^ 0x75bd924
   }
 
+  def nextNRand(seed: Int, count: Int): Array[Int] = {
+    val seeds = new Array[Int](count + 16)
+    seeds(0) = seed;
+
+    for (x <- 1 until count + 16) {
+      seeds(x) = nextRand(seeds(x-1))
+    }
+
+    seeds
+  }
+
   def pick(seedIndex: Int, seedsArray: Array[Int]): Array[Int] = {
     val items = new Array[Int](6)
     var rand: Int = 0
@@ -117,7 +128,7 @@ object Solver {
   }
 
   def getAll(seedIndex: Int, seedsArray: Array[Int]): (Array[Int], Array[Int]) = 
-    (pick(seedIndex, seedsArray), pick(seedIndex + 6, seedsArray))
+    (pick(seedIndex, seedsArray), pick(seedIndex + 8, seedsArray))
 
   def getMinMax(threadIdx: Int, startIdx: Int, endIdx: Int, costs: Array[Double], seedsArray: Array[Int]): (Result, Result) =
   {
@@ -201,7 +212,7 @@ object Solver {
     MemoryUtil.memASCII(buffer, bytes - 1)
   }
 
-  def computeGPU(start: Int, seedCount: Int, seedsPerKernel: Int, points: List[Vec2], seeds: Array[Int], resultCount: Int): (List[Result], List[Result]) = {
+  def computeGPU(startSeed: Int, seedCount: Int, seedsPerKernel: Int, points: List[Vec2], resultCount: Int): (List[Result], List[Result]) = {
     val openCL = initializeOpenCL().get
     
     val err = MemoryUtil.memAllocInt(1)
@@ -226,21 +237,26 @@ object Solver {
     checkCLError(err)
 
     val tasksNeeded = Math.max(seedCount / seedsPerKernel, 1)
-    val tasks = (Range(start, start + seedCount, seedCount / tasksNeeded) :+ (start + seedCount)).sliding(2).toList
+    val tasks = (Range(startSeed, startSeed + seedCount, seedCount / tasksNeeded) :+ (startSeed + seedCount)).sliding(2).toList
     
     println("Computing in " + tasks.length + " task(s)")
     
-    val results = tasks.map(t => computeGPUIndividual(t.head, t.last - t.head, points, seeds, permutations, permuteMemory, kernel, openCL, resultCount))
+    val results = tasks.map(t => computeGPUIndividual(t.head/(seedCount/tasksNeeded), t.head, t.last - t.head, points, permutations, permuteMemory, kernel, openCL, resultCount))
    
     (results.flatMap(r => r._1).sortBy(m => m.path.cost).take(resultCount), results.flatMap(r => r._2).sortBy(m => -m.path.cost).take(resultCount))
   }
 
-  def computeGPUIndividual(start: Int, seedCount: Int, points: List[Vec2], seeds: Array[Int], permutations: List[Seq[Int]], permutationBuffer: Long, kernel: Long, openCL: CLInfo, resultCount: Int): (List[Result], List[Result]) = {
+  def computeGPUIndividual(idx: Int, startSeed: Int, seedCount: Int, points: List[Vec2], permutations: List[Seq[Int]], permutationBuffer: Long, kernel: Long, openCL: CLInfo, resultCount: Int): (List[Result], List[Result]) = {
     val err = MemoryUtil.memAllocInt(1)
-    
 
-    println("Computing " + start + " to " + (start + seedCount))
-    val allPoints = Range(start, start + seedCount, 1)
+    var seed = 0;
+    for (x <- 1 until startSeed) {
+      seed = nextRand(seed)
+    }
+
+    val seeds = nextNRand(seed, seedCount); 
+
+    val allPoints = Range(0, seedCount, 1)
       .map(getAll(_, seeds))
       .map(p => p._1 ++ p._2)
       .flatMap(p => p.map(points(_))) 
@@ -273,7 +289,7 @@ object Solver {
     localWorkSize.put(0, 120)
     localWorkSize.put(1, 1)
     localWorkSize.put(2, 1)
-
+    
     checkCLError(CL10.clEnqueueNDRangeKernel(openCL.queue, kernel, 3, null, workSize, localWorkSize, null, null))
     
     val resultBuffer = MemoryUtil.memAllocFloat(seedCount * 6 * 2)
@@ -299,7 +315,7 @@ object Solver {
       val minFirstPoints  = Vec2(5.15, -5.0) +: permutations(idBuffer.get(min._2 * 12 + min._1._1) / 5).map(idx => allPoints(min._2 * 12 + idx)) :+ allPoints(min._2 * 12 + min._1._1)
       val minSecondPoints = List(allPoints(min._2 * 12 + min._1._1), allPoints(min._2 * 12 + min._1._2 + 6)) ++ permutations(idBuffer.get(min._2 * 12 + min._1._2 + 6) / 5).reverse.map(idx => allPoints(min._2 * 12 + idx + 6))
       
-      Result((start + min._2, seeds(start + min._2)), Solution(minFirstPoints.map(points.indexOf(_)).toArray, minSecondPoints.map(points.indexOf(_)).toArray, min._1._3))
+      Result((startSeed + min._2, seeds(min._2)), Solution(minFirstPoints.map(points.indexOf(_)).toArray, minSecondPoints.map(points.indexOf(_)).toArray, min._1._3))
     }
 
     val maxs = for (x <- (values.length - resultCount until values.length).reverse) yield {
@@ -308,7 +324,7 @@ object Solver {
       val maxFirstPoints  = Vec2(5.15, -5.0) +: permutations(idBuffer.get(max._2 * 12 + max._1._1) / 5).map(idx => allPoints(max._2 * 12 + idx)) :+ allPoints(max._2 * 12 + max._1._1)
       val maxSecondPoints = List(allPoints(max._2 * 12 + max._1._1), allPoints(max._2 * 12 + max._1._2 + 6)) ++ permutations(idBuffer.get(max._2 * 12 + max._1._2 + 6) / 5).reverse.map(idx => allPoints(max._2 * 12 + idx + 6))
     
-      Result((start + max._2, seeds(start + max._2)), Solution(maxFirstPoints.map(points.indexOf(_)).toArray, maxSecondPoints.map(points.indexOf(_)).toArray, max._1._3))
+      Result((startSeed + max._2, seeds(max._2)), Solution(maxFirstPoints.map(points.indexOf(_)).toArray, maxSecondPoints.map(points.indexOf(_)).toArray, max._1._3))
     }
 
     checkCLError(CL10.clReleaseMemObject(pointsMemory))
@@ -319,7 +335,7 @@ object Solver {
     MemoryUtil.memFree(resultBuffer)
     MemoryUtil.memFree(idBuffer)
     
-    println("Computed " + start + " to " + (start + seedCount))
+    println("Computed batch " + idx + " (" + startSeed + "->" + (startSeed + seedCount) + "), best is " + mins.head._2._3)
 
     (mins.toList, maxs.toList)
   }
@@ -368,10 +384,10 @@ object Solver {
       Map("showOutput" -> "true",
           "start" -> "0",
           "startSeed" -> "0",
-          "seedCount" -> "10000",
+          "seedCount" -> "1000000000",
           "seedsPerKernel" -> "1000000",
           "output" -> "./",
-          "resultCount" -> "1",
+          "resultCount" -> "5",
           "dumpAll" -> "false"),
         args.toList)
     
@@ -419,17 +435,10 @@ object Solver {
       .flatMap(p => points.map(p2 => distance(p, p2)))
       .toArray
 
-    println("Computing seeds")
-    val seeds = new Array[Int](start + seedCount + 20)
-    seeds(0) = startSeed;
-
-    for (x <- 1 until start + seedCount + 20) {
-      seeds(x) = nextRand(seeds(x-1))
-    }
     println("Calculating paths")
    
     val gpuStartTime = System.nanoTime()
-    val gpuResult = computeGPU(start, seedCount, seedsPerKernel, points, seeds, resultCount)
+    val gpuResult = computeGPU(start, seedCount, seedsPerKernel, points, resultCount)
     val gpuEndTime = System.nanoTime()
     println("GPU took " + (gpuEndTime - gpuStartTime) / 100000000 + " seconds")
 
